@@ -21,11 +21,11 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/osrg/gobgp/client"
 	"github.com/osrg/gobgp/packet/bgp"
 	"github.com/osrg/gobgp/table"
 	"github.com/osrg/goplane/config"
+	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"gopkg.in/tomb.v2"
@@ -370,7 +370,7 @@ func (n *VirtualNetwork) sendMulticast(withdraw bool) error {
 		IPAddress:       net.ParseIP(n.routerId),
 		ETag:            uint32(n.config.Etag),
 	}
-	nlri := bgp.NewEVPNNLRI(bgp.EVPN_INCLUSIVE_MULTICAST_ETHERNET_TAG, 0, multicastEtag)
+	nlri := bgp.NewEVPNNLRI(bgp.EVPN_INCLUSIVE_MULTICAST_ETHERNET_TAG, multicastEtag)
 	nexthop := "0.0.0.0"
 	pattrs = append(pattrs, bgp.NewPathAttributeMpReachNLRI(nexthop, []bgp.AddrPrefixInterface{nlri}))
 
@@ -397,16 +397,16 @@ func (f *VirtualNetwork) modPath(n *netlinkEvent) error {
 		Labels:           []uint32{uint32(f.config.VNI)},
 		ETag:             uint32(f.config.Etag),
 	}
-	nlri := bgp.NewEVPNNLRI(bgp.EVPN_ROUTE_TYPE_MAC_IP_ADVERTISEMENT, 0, macIpAdv)
+	nlri := bgp.NewEVPNNLRI(bgp.EVPN_ROUTE_TYPE_MAC_IP_ADVERTISEMENT, macIpAdv)
 	nexthop := "0.0.0.0"
 	pattrs = append(pattrs, bgp.NewPathAttributeMpReachNLRI(nexthop, []bgp.AddrPrefixInterface{nlri}))
 
 	pattrs = append(pattrs, bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP))
 
-	isTransitive := true
-	o := bgp.NewOpaqueExtended(isTransitive)
-	o.SubType = bgp.EC_SUBTYPE_ENCAPSULATION
-	o.Value = &bgp.EncapExtended{bgp.TUNNEL_TYPE_VXLAN}
+	o := &bgp.EncapExtended{
+		TunnelType: bgp.TUNNEL_TYPE_VXLAN,
+	}
+
 	pattrs = append(pattrs, bgp.NewPathAttributeExtendedCommunities([]bgp.ExtendedCommunityInterface{o}))
 	path := table.NewPath(nil, nlri, n.isWithdraw, pattrs, time.Now(), false)
 

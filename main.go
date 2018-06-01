@@ -24,17 +24,18 @@ import (
 	"strings"
 	"syscall"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/Sirupsen/logrus/hooks/syslog"
 	"github.com/jessevdk/go-flags"
 	"github.com/osrg/goplane/config"
 	"github.com/osrg/goplane/iptables"
 	"github.com/osrg/goplane/netlink"
+	log "github.com/sirupsen/logrus"
+	hooksyslog "github.com/sirupsen/logrus/hooks/syslog"
 
 	bgpapi "github.com/osrg/gobgp/api"
 	bgpconfig "github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/packet/bgp"
 	bgpserver "github.com/osrg/gobgp/server"
+	"github.com/osrg/gobgp/table"
 )
 
 type Dataplaner interface {
@@ -134,7 +135,7 @@ func main() {
 			facility = syslog.LOG_LOCAL7
 		}
 
-		hook, err := logrus_syslog.NewSyslogHook(network, addr, syslog.LOG_INFO|facility, "bgpd")
+		hook, err := hooksyslog.NewSyslogHook(network, addr, syslog.LOG_INFO|facility, "bgpd")
 		if err != nil {
 			log.Error("Unable to connect to syslog daemon, ", opts.UseSyslog)
 			os.Exit(1)
@@ -182,6 +183,7 @@ func main() {
 			}
 
 			var added, deleted, updated []bgpconfig.Neighbor
+			var addedPg, deletedPg, updatedPg []bgpconfig.PeerGroup
 			var updatePolicy bool
 
 			if c == nil {
@@ -209,6 +211,31 @@ func main() {
 						log.Fatalf("failed to set bmp config: %s", err)
 					}
 				}
+				for _, vrf := range newConfig.Vrfs {
+					rd, err := bgp.ParseRouteDistinguisher(vrf.Config.Rd)
+					if err != nil {
+						log.Fatalf("failed to load vrf rd config: %s", err)
+					}
+					importRtList := make([]bgp.ExtendedCommunityInterface, 0, len(vrf.Config.ImportRtList))
+					for _, rtString := range vrf.Config.ImportRtList {
+						rt, err := bgp.ParseRouteTarget(rtString)
+						if err != nil {
+							log.Fatalf("failed to load vrf import rt config: %s", err)
+						}
+						importRtList = append(importRtList, rt)
+					}
+					exportRtList := make([]bgp.ExtendedCommunityInterface, 0, len(vrf.Config.ExportRtList))
+					for _, rtString := range vrf.Config.ExportRtList {
+						rt, err := bgp.ParseRouteTarget(rtString)
+						if err != nil {
+							log.Fatalf("failed to load vrf export rt config: %s", err)
+						}
+						exportRtList = append(exportRtList, rt)
+					}
+					if err := bgpServer.AddVrf(vrf.Config.Name, vrf.Config.Id, rd, importRtList, exportRtList); err != nil {
+						log.Fatalf("failed to set vrf config: %s", err)
+					}
+				}
 				for _, c := range newConfig.MrtDump {
 					if len(c.Config.FileName) == 0 {
 						continue
@@ -223,6 +250,7 @@ func main() {
 				}
 
 				added = newConfig.Neighbors
+				addedPg = newConfig.PeerGroups
 				if opts.GracefulRestart {
 					for i, n := range added {
 						if n.GracefulRestart.Config.Enabled {
@@ -232,15 +260,76 @@ func main() {
 				}
 
 			} else {
-				added, deleted, updated, updatePolicy = bgpconfig.UpdateConfig(c, newConfig)
+				addedPg, deletedPg, updatedPg = bgpconfig.UpdatePeerGroupConfig(c, newConfig)
+				added, deleted, updated = bgpconfig.UpdateNeighborConfig(c, newConfig)
+				updatePolicy = bgpconfig.CheckPolicyDifference(bgpconfig.ConfigSetToRoutingPolicy(c), bgpconfig.ConfigSetToRoutingPolicy(newConfig))
 				if updatePolicy {
 					log.Info("Policy config is updated")
 					p := bgpconfig.ConfigSetToRoutingPolicy(newConfig)
 					bgpServer.UpdatePolicy(*p)
 				}
+				// global policy update
+				if !newConfig.Global.ApplyPolicy.Config.Equal(&c.Global.ApplyPolicy.Config) {
+					a := newConfig.Global.ApplyPolicy.Config
+					toDefaultTable := func(r bgpconfig.DefaultPolicyType) table.RouteType {
+						var def table.RouteType
+						switch r {
+						case bgpconfig.DEFAULT_POLICY_TYPE_ACCEPT_ROUTE:
+							def = table.ROUTE_TYPE_ACCEPT
+						case bgpconfig.DEFAULT_POLICY_TYPE_REJECT_ROUTE:
+							def = table.ROUTE_TYPE_REJECT
+						}
+						return def
+					}
+					toPolicyDefinitions := func(r []string) []*bgpconfig.PolicyDefinition {
+						p := make([]*bgpconfig.PolicyDefinition, 0, len(r))
+						for _, n := range r {
+							p = append(p, &bgpconfig.PolicyDefinition{
+								Name: n,
+							})
+						}
+						return p
+					}
+
+					def := toDefaultTable(a.DefaultImportPolicy)
+					ps := toPolicyDefinitions(a.ImportPolicyList)
+					bgpServer.ReplacePolicyAssignment("", table.POLICY_DIRECTION_IMPORT, ps, def)
+
+					def = toDefaultTable(a.DefaultExportPolicy)
+					ps = toPolicyDefinitions(a.ExportPolicyList)
+					bgpServer.ReplacePolicyAssignment("", table.POLICY_DIRECTION_EXPORT, ps, def)
+
+					updatePolicy = true
+
+				}
 				c = newConfig
 			}
-
+			for i, pg := range addedPg {
+				log.Infof("PeerGroup %s is added", pg.Config.PeerGroupName)
+				if err := bgpServer.AddPeerGroup(&addedPg[i]); err != nil {
+					log.Warn(err)
+				}
+			}
+			for i, pg := range deletedPg {
+				log.Infof("PeerGroup %s is deleted", pg.Config.PeerGroupName)
+				if err := bgpServer.DeletePeerGroup(&deletedPg[i]); err != nil {
+					log.Warn(err)
+				}
+			}
+			for i, pg := range updatedPg {
+				log.Infof("PeerGroup %s is updated", pg.Config.PeerGroupName)
+				u, err := bgpServer.UpdatePeerGroup(&updatedPg[i])
+				if err != nil {
+					log.Warn(err)
+				}
+				updatePolicy = updatePolicy || u
+			}
+			for i, dn := range newConfig.DynamicNeighbors {
+				log.Infof("Dynamic Neighbor %s is added to PeerGroup %s", dn.Config.Prefix, dn.Config.PeerGroup)
+				if err := bgpServer.AddDynamicNeighbor(&newConfig.DynamicNeighbors[i]); err != nil {
+					log.Warn(err)
+				}
+			}
 			for i, p := range added {
 				log.Infof("Peer %v is added", p.Config.NeighborAddress)
 				bgpServer.AddNeighbor(&added[i])
